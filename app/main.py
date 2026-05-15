@@ -10,19 +10,54 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+# Loads environment variables from .env file
+# Useful for storing secrets like API keys
 from dotenv import load_dotenv
+
+# FastAPI framework imports
 from fastapi import FastAPI, HTTPException, Query
+
+# FAISS vector database for semantic similarity search
 from langchain_community.vectorstores import FAISS
+
+# Standard LangChain document object
 from langchain_core.documents import Document
+
+# Converts model output into plain string
 from langchain_core.output_parsers import StrOutputParser
+
+# Used for prompt engineering
 from langchain_core.prompts import ChatPromptTemplate
+
+# Groq LLM integration
 from langchain_groq import ChatGroq
+
+# Embedding model wrapper
 from langchain_huggingface import HuggingFaceEmbeddings
+
+# Splits large documents into smaller chunks
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# Request validation using Pydantic
 from pydantic import BaseModel, Field
+
+
+# ============================================================
+# Load environment variables
+# ============================================================
 
 load_dotenv()
 
+
+# ============================================================
+# Logging configuration
+# ============================================================
+
+# Logging helps in:
+# - debugging
+# - observability
+# - monitoring
+# - incident analysis
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -30,6 +65,16 @@ logging.basicConfig(
 
 logger = logging.getLogger("repo_rag_api")
 
+
+# ============================================================
+# FastAPI App Initialization
+# ============================================================
+
+# FastAPI is preferred because:
+# - async support
+# - automatic Swagger docs
+# - high performance
+# - built-in validation support
 app = FastAPI(
     title="Repo RAG API",
     description="Analyze Java/Spring Boot repositories using RAG.",
@@ -39,10 +84,30 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+
+# ============================================================
+# Application Constants
+# ============================================================
+
+# Prevent indexing huge files
+# to avoid memory and embedding overhead
 MAX_FILE_SIZE_BYTES = 200_000
+
+# Maximum files indexed from repository
 MAX_FILES = 120
+
+# Number of chunks retrieved during semantic search
 RETRIEVAL_K = 8
 
+
+# ============================================================
+# Ignored directories
+# ============================================================
+
+# Ignoring unnecessary folders improves:
+# - indexing speed
+# - memory efficiency
+# - retrieval quality
 IGNORED_DIRS = {
     ".git",
     ".mypy_cache",
@@ -57,6 +122,13 @@ IGNORED_DIRS = {
     ".idea",
 }
 
+
+# ============================================================
+# Supported file extensions
+# ============================================================
+
+# Only relevant project files are indexed
+# Helps reduce noise during retrieval
 CODE_EXTENSIONS = {
     ".java",
     ".yml",
@@ -67,6 +139,13 @@ CODE_EXTENSIONS = {
     ".md",
 }
 
+
+# ============================================================
+# File importance scoring
+# ============================================================
+
+# Weighted retrieval improves RAG quality.
+# Important files receive higher retrieval priority.
 IMPORTANT_FILE_PATTERNS = {
     "readme": 10,
 
@@ -93,6 +172,13 @@ IMPORTANT_FILE_PATTERNS = {
     "test": 1,
 }
 
+
+# ============================================================
+# Ignored methods
+# ============================================================
+
+# Boilerplate methods are skipped because
+# they do not provide business logic insights
 IGNORED_METHODS = {
     "hashcode",
     "equals",
@@ -101,19 +187,54 @@ IGNORED_METHODS = {
     "setter",
 }
 
+
+# ============================================================
+# In-memory indexed repositories
+# ============================================================
+
+# Structure:
+# {
+#   repo_url: {
+#       vector_store,
+#       insights,
+#       document_count
+#   }
+# }
+#
+# This acts as an in-memory cache.
 INDEXED_REPOS: dict[str, dict[str, Any]] = {}
 
+
+# Lazy-loaded embedding model
 EMBEDDINGS: HuggingFaceEmbeddings | None = None
 
 
+# ============================================================
+# Request Model
+# ============================================================
+
+# Pydantic automatically:
+# - validates input
+# - generates OpenAPI schema
+# - improves API reliability
 class RepoRequest(BaseModel):
+
     repo_url: str = Field(
         ...,
         description="Public Git repository URL",
     )
 
 
+# ============================================================
+# Validate repository URL
+# ============================================================
+
 def validate_repo_url(repo_url: str) -> str:
+    """
+    Validates whether the provided URL is a proper HTTP/HTTPS Git URL.
+    Prevents malformed or invalid repository requests.
+    """
+
     parsed = urlparse(repo_url)
 
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -125,7 +246,20 @@ def validate_repo_url(repo_url: str) -> str:
     return repo_url
 
 
+# ============================================================
+# Clone Git Repository
+# ============================================================
+
 def clone_repo(repo_url: str, destination: Path) -> None:
+    """
+    Clones the Git repository into a temporary folder.
+
+    Uses shallow clone for:
+    - faster execution
+    - lower bandwidth usage
+    - reduced storage usage
+    """
+
     try:
         subprocess.run(
             ["git", "clone", "--depth", "1", repo_url, str(destination)],
@@ -136,12 +270,14 @@ def clone_repo(repo_url: str, destination: Path) -> None:
         )
 
     except subprocess.TimeoutExpired as exc:
+
         raise HTTPException(
             status_code=504,
             detail="Repository clone timed out",
         ) from exc
 
     except subprocess.CalledProcessError as exc:
+
         message = (
             exc.stderr.strip()
             or exc.stdout.strip()
@@ -154,24 +290,60 @@ def clone_repo(repo_url: str, destination: Path) -> None:
         ) from exc
 
 
+# ============================================================
+# Ignore unwanted folders
+# ============================================================
+
 def is_ignored(path: Path) -> bool:
+    """
+    Checks whether the file path belongs
+    to ignored directories.
+    """
+
     return any(part in IGNORED_DIRS for part in path.parts)
 
 
+# ============================================================
+# File priority scoring
+# ============================================================
+
 def get_document_priority(source: str) -> int:
+    """
+    Assigns importance score to files.
+
+    Higher score means higher retrieval preference.
+    """
+
     source_lower = source.lower()
 
     for keyword, score in IMPORTANT_FILE_PATTERNS.items():
+
         if keyword in source_lower:
             return score
 
     return 5
 
 
+# ============================================================
+# Load repository documents
+# ============================================================
+
 def load_repo_documents(repo_path: Path) -> list[Document]:
+    """
+    Reads repository files and converts them
+    into LangChain Document objects.
+
+    Filters:
+    - unsupported file types
+    - large files
+    - ignored directories
+    - empty files
+    """
+
     documents: list[Document] = []
 
     for path in sorted(repo_path.rglob("*")):
+
         if len(documents) >= MAX_FILES:
             break
 
@@ -198,7 +370,7 @@ def load_repo_documents(repo_path: Path) -> list[Document]:
         if not content.strip():
             continue
 
-        # README boost
+        # README boost improves project understanding
         if relative_path.name.lower().startswith("readme"):
             content = "PROJECT OVERVIEW\n\n" + content
 
@@ -213,15 +385,28 @@ def load_repo_documents(repo_path: Path) -> list[Document]:
         )
 
     if not documents:
+
         raise HTTPException(
             status_code=400,
             detail="No readable repository files found",
         )
-    print(documents[0])
+
     return documents
 
 
+# ============================================================
+# Extract Java methods using Regex
+# ============================================================
+
 def extract_java_methods(document: Document) -> list[dict[str, str]]:
+    """
+    Extracts Java methods from source files using regex.
+
+    Avoids:
+    - constructors
+    - boilerplate methods
+    """
+
     pattern = (
         r"(?:public|private|protected)"
         r"\s+(?:static\s+)?"
@@ -233,12 +418,13 @@ def extract_java_methods(document: Document) -> list[dict[str, str]]:
     methods: list[dict[str, str]] = []
 
     for match in re.finditer(pattern, document.page_content):
+
         name = match.group(1)
 
         if name.lower() in IGNORED_METHODS:
             continue
 
-        # Ignore constructors
+        # Constructors usually start with uppercase
         if name[0].isupper():
             continue
 
@@ -256,7 +442,21 @@ def extract_java_methods(document: Document) -> list[dict[str, str]]:
     return methods
 
 
+# ============================================================
+# Extract Repository Insights
+# ============================================================
+
 def extract_repo_insights(documents: list[Document]) -> dict[str, Any]:
+    """
+    Generates repository statistics and complexity insights.
+
+    Includes:
+    - file type distribution
+    - total lines of code
+    - extracted methods
+    - complexity indicators
+    """
+
     file_types = Counter(
         Path(doc.metadata.get("source", "")).suffix
         or "[no extension]"
@@ -273,6 +473,7 @@ def extract_repo_insights(documents: list[Document]) -> dict[str, Any]:
     complexity_markers = Counter()
 
     for document in documents:
+
         source = document.metadata.get("source", "")
 
         suffix = Path(source).suffix.lower()
@@ -280,6 +481,7 @@ def extract_repo_insights(documents: list[Document]) -> dict[str, Any]:
         if suffix == ".java":
             methods.extend(extract_java_methods(document))
 
+        # Basic complexity indicators
         for marker in (
             "if ",
             "for ",
@@ -288,12 +490,14 @@ def extract_repo_insights(documents: list[Document]) -> dict[str, Any]:
             "case ",
             "catch ",
         ):
+
             complexity_markers[marker.strip()] += (
                 document.page_content.count(marker)
             )
 
     complexity_score = sum(complexity_markers.values())
 
+    # Complexity classification
     if complexity_score < 25:
         complexity_level = "low"
 
@@ -303,6 +507,7 @@ def extract_repo_insights(documents: list[Document]) -> dict[str, Any]:
     else:
         complexity_level = "high"
 
+    # Prioritize important methods
     ranked_methods = sorted(
         methods,
         key=lambda method: (
@@ -326,10 +531,23 @@ def extract_repo_insights(documents: list[Document]) -> dict[str, Any]:
     }
 
 
+# ============================================================
+# Lazy-load embeddings
+# ============================================================
+
 def get_embeddings() -> HuggingFaceEmbeddings:
+    """
+    Loads embedding model only once.
+
+    Improves:
+    - memory usage
+    - startup efficiency
+    """
+
     global EMBEDDINGS
 
     if EMBEDDINGS is None:
+
         EMBEDDINGS = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
@@ -337,7 +555,19 @@ def get_embeddings() -> HuggingFaceEmbeddings:
     return EMBEDDINGS
 
 
+# ============================================================
+# Build Vector Store
+# ============================================================
+
 def build_vector_store(documents: list[Document]) -> FAISS:
+    """
+    Splits documents into chunks
+    and creates FAISS vector index.
+
+    Chunk overlap helps preserve context
+    across adjacent chunks.
+    """
+
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1200,
         chunk_overlap=200,
@@ -352,12 +582,25 @@ def build_vector_store(documents: list[Document]) -> FAISS:
     )
 
 
+# ============================================================
+# Update Repository Index
+# ============================================================
+
 def update_repo_index(repo_url: str) -> dict[str, Any]:
+    """
+    Complete indexing pipeline:
+    1. Clone repository
+    2. Load documents
+    3. Generate repository insights
+    4. Create vector embeddings
+    """
+
     temp_dir = Path(tempfile.mkdtemp(prefix="repo-rag-"))
 
     repo_dir = temp_dir / "repo"
 
     try:
+
         clone_repo(repo_url, repo_dir)
 
         documents = load_repo_documents(repo_dir)
@@ -381,14 +624,28 @@ def update_repo_index(repo_url: str) -> dict[str, Any]:
         }
 
     finally:
+
+        # Always clean temporary files
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+# ============================================================
+# Parse LLM JSON output
+# ============================================================
+
 def parse_json_response(answer: str) -> dict[str, Any]:
+    """
+    Converts LLM response string into JSON.
+
+    Includes fallback handling in case
+    invalid JSON is returned.
+    """
+
     try:
         return json.loads(answer)
 
     except json.JSONDecodeError:
+
         return {
             "overview": answer,
             "architecture": "",
@@ -398,13 +655,28 @@ def parse_json_response(answer: str) -> dict[str, Any]:
         }
 
 
+# ============================================================
+# Build Repository Analysis
+# ============================================================
+
 def build_analysis(
     repo_url: str,
     vector_store: FAISS,
     insights: dict[str, Any],
 ) -> dict[str, Any]:
+    """
+    Main RAG analysis pipeline.
+
+    Flow:
+    User Query ->
+    Vector Search ->
+    Context Retrieval ->
+    Prompt Construction ->
+    LLM Response Generation
+    """
 
     if not os.getenv("GROQ_API_KEY"):
+
         raise HTTPException(
             status_code=500,
             detail="GROQ_API_KEY not found",
@@ -417,17 +689,20 @@ def build_analysis(
         "key methods, complexity, and noteworthy implementation details."
     )
 
+    # Semantic similarity search
     retrieved_docs = vector_store.similarity_search(
         question,
         k=30,
     )
 
+    # Re-rank documents using file priority
     docs = sorted(
         retrieved_docs,
         key=lambda doc: doc.metadata.get("priority", 5),
         reverse=True,
     )[:RETRIEVAL_K]
 
+    # Spring Boot framework detection
     is_spring_boot = any(
         "@SpringBootApplication" in doc.page_content
         or "@RestController" in doc.page_content
@@ -441,6 +716,7 @@ def build_analysis(
         else "Framework is unclear."
     )
 
+    # Build RAG context
     context = "\n\n".join(
         f"File: {doc.metadata.get('source', 'unknown')}\n"
         f"{doc.page_content}"
@@ -449,55 +725,58 @@ def build_analysis(
 
     static_insights = json.dumps(insights, indent=2)
 
+    # Prompt Engineering
     prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a senior Java software architect. "
-            "Use only the supplied repository context. "
-            "Focus on Spring Boot architecture, APIs, "
-            "services, repositories, entities, "
-            "business functionality, and implementation details. "
-            "Return valid JSON only.",
-        ),
-        (
-            "human",
-            "Repository URL: {repo_url}\n\n"
-            "Framework hint:\n{framework_hint}\n\n"
-            "Static insights:\n{static_insights}\n\n"
-            "Retrieved context:\n{context}\n\n"
-            "Question:\n{question}\n\n"
-            "If the repository contains controllers, services, "
-            "repositories, entities, or Spring annotations, "
-            "explain the layered architecture clearly.\n\n"
-            "Return this JSON shape:\n"
-            "{{\n"
-            '  "overview": "project purpose",\n'
-            '  "architecture": "high level architecture",\n'
-            '  "key_methods": [\n'
-            "    {{\n"
-            '      "file": "path",\n'
-            '      "signature": "method(args)",\n'
-            '      "description": "what it does"\n'
-            "    }}\n"
-            "  ],\n"
-            '  "complexity": {{\n'
-            '    "level": "low|moderate|high",\n'
-            '    "explanation": "why"\n'
-            "  }},\n"
-            '  "noteworthy_aspects": [\n'
-            '    "important implementation details"\n'
-            "  ]\n"
-            "}}",
-        ),
-    ]
-)
+        [
+            (
+                "system",
+                "You are a senior Java software architect. "
+                "Use only the supplied repository context. "
+                "Focus on Spring Boot architecture, APIs, "
+                "services, repositories, entities, "
+                "business functionality, and implementation details. "
+                "Return valid JSON only.",
+            ),
+            (
+                "human",
+                "Repository URL: {repo_url}\n\n"
+                "Framework hint:\n{framework_hint}\n\n"
+                "Static insights:\n{static_insights}\n\n"
+                "Retrieved context:\n{context}\n\n"
+                "Question:\n{question}\n\n"
+                "If the repository contains controllers, services, "
+                "repositories, entities, or Spring annotations, "
+                "explain the layered architecture clearly.\n\n"
+                "Return this JSON shape:\n"
+                "{{\n"
+                '  "overview": "project purpose",\n'
+                '  "architecture": "high level architecture",\n'
+                '  "key_methods": [\n'
+                "    {{\n"
+                '      "file": "path",\n'
+                '      "signature": "method(args)",\n'
+                '      "description": "what it does"\n'
+                "    }}\n"
+                "  ],\n"
+                '  "complexity": {{\n'
+                '    "level": "low|moderate|high",\n'
+                '    "explanation": "why"\n'
+                "  }},\n"
+                '  "noteworthy_aspects": [\n'
+                '    "important implementation details"\n'
+                "  ]\n"
+                "}}",
+            ),
+        ]
+    )
 
+    # LLM initialization
     llm = ChatGroq(
         model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
         temperature=0.1,
     )
 
+    # LangChain pipeline
     chain = prompt | llm | StrOutputParser()
 
     answer = chain.invoke(
@@ -525,22 +804,56 @@ def build_analysis(
     }
 
 
+# ============================================================
+# Root Endpoint
+# ============================================================
+
 @app.get("/")
 def read_root() -> dict[str, str]:
+    """
+    Basic API status endpoint.
+    """
+
     return {"message": "Repo RAG API is running"}
 
 
+# ============================================================
+# Health Check Endpoint
+# ============================================================
+
 @app.get("/health")
 def health_check() -> dict[str, str]:
+    """
+    Health monitoring endpoint.
+
+    Used by:
+    - load balancers
+    - monitoring systems
+    - deployment checks
+    """
+
     return {"status": "ok"}
 
 
+# ============================================================
+# Repository Embedding Endpoint
+# ============================================================
+
 @app.post("/embeddings/update")
 def update_embeddings(request: RepoRequest) -> dict[str, Any]:
+    """
+    Creates embeddings and vector index
+    for the provided repository.
+    """
+
     repo_url = validate_repo_url(request.repo_url)
 
     return update_repo_index(repo_url)
 
+
+# ============================================================
+# Analysis Endpoint
+# ============================================================
 
 @app.get("/analysis")
 def analyze_repo(
@@ -549,12 +862,17 @@ def analyze_repo(
         description="Public Git repository URL",
     ),
 ) -> dict[str, Any]:
+    """
+    Performs repository analysis using
+    retrieval augmented generation.
+    """
 
     repo_url = validate_repo_url(repo_url)
 
     indexed_repo = INDEXED_REPOS.get(repo_url)
 
     if not indexed_repo:
+
         raise HTTPException(
             status_code=404,
             detail="Repository is not indexed yet. Call /embeddings/update first.",
